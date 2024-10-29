@@ -1,318 +1,246 @@
-<!-- src/components/RemoteDesktop.vue -->
 <template>
-  <div class="remote-desktop-container">
-    <video ref="remoteVideo" autoplay playsinline></video>
-    <div
-        class="control-area"
-        @mousemove="handleMouseMove"
-        @click="handleClick"
-        @keydown="handleKeyPress"
-        tabindex="0"
-    >
-      <p>控制区域：移动鼠标或点击</p>
-    </div>
-    <button v-if="!isController && !isDenied" @click="requestControl">
-      请求控制
-    </button>
-    <button v-if="isController" @click="releaseControl">
-      释放控制
-    </button>
-    <p v-if="isDenied" class="warning">控制权已被占用，请稍后再试。</p>
+  <div id="app">
+    <video id="remoteVideo" autoplay playsinline @mousemove="handleMouseMove" @click="handleMouseClick"></video>
   </div>
 </template>
 
 <script>
-import SimplePeer from 'simple-peer'
-
 export default {
   name: 'RemoteDesktop',
   data() {
     return {
-      peer: null,
-      ws: null,
-      isController: false,
-      isDenied: false,
+      signalingServerUrl: 'ws://192.168.40.100:8080/ws', // 替换为您的信令服务器地址
+      websocket: null,
+      peerConnection: null,
+      dataChannel: null,
+      controlEventsSetup: false,
+      iceServers: [{
+        urls: ['turn:192.168.40.100:23478'], // 替换为您的 TURN 服务器地址和端口
+        username: 'jimmy', // 替换为您的 TURN 服务器用户名
+        credential: 'apple' // 替换为您的 TURN 服务器密码
+      }],
     }
   },
   mounted() {
-    this.initWebRTC()
+    this.initWebSocket();
   },
   methods: {
-    initWebRTC() {
-      // 连接到中继服务器的 WebSocket
-      this.ws = new WebSocket('ws://127.0.0.1:8080/ws') // 替换为服务端B的实际IP
+    initWebSocket() {
+      this.websocket = new WebSocket(this.signalingServerUrl);
 
-      this.ws.onopen = () => {
-        console.log('Connected to signaling server.')
-
+      this.websocket.onopen = () => {
+        console.log('WebSocket 连接已打开');
         // 注册为 viewer
-        const register = {
+        const registerMessage = {
           type: 'register',
-          payload: { role: 'viewer' },
+          payload: {
+            role: 'viewer'
+          }
+        };
+        this.websocket.send(JSON.stringify(registerMessage));
+      };
+
+      this.websocket.onmessage = this.handleSignalingMessage;
+      this.websocket.onerror = (error) => {
+        console.error('WebSocket 错误:', error);
+      };
+      this.websocket.onclose = () => {
+        console.log('WebSocket 连接已关闭');
+      };
+    },
+    handleSignalingMessage(event) {
+      const message = JSON.parse(event.data);
+      console.log('收到信令服务器消息:', message);
+
+      switch (message.type) {
+        case 'register_success':
+          console.log('成功注册为 viewer');
+          // 注册成功后，初始化 WebRTC 连接
+          this.initPeerConnection();
+          break;
+        case 'register_failed':
+          console.error('注册失败:', message.payload.reason);
+          break;
+        case 'answer':
+          this.handleAnswer(message.payload);
+          break;
+        case 'candidate':
+          this.handleCandidate(message.payload);
+          break;
+        case 'desktop_disconnected':
+          console.log('桌面端已断开连接');
+          // 处理断开连接的情况
+          break;
+        default:
+          console.warn('未知的消息类型:', message.type);
+      }
+    },
+    initPeerConnection() {
+      this.peerConnection = new RTCPeerConnection({
+        iceServers: this.iceServers,
+        iceTransportPolicy: 'relay' // 强制使用 TURN 服务器
+      });
+
+      // 处理 ICE 候选
+      this.peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+          const candidateMessage = {
+            type: 'candidate',
+            payload: {
+              candidate: event.candidate.toJSON()
+            }
+          };
+          this.websocket.send(JSON.stringify(candidateMessage));
+          console.log('发送 ICE 候选:', candidateMessage);
         }
-        this.ws.send(JSON.stringify(register))
-        console.log('Sent register message:', register)
+      };
 
-        // 初始化 SimplePeer，作为 Initiator
-        this.peer = new SimplePeer({
-          initiator: true, // 设置为 true，确保 Viewer 作为 Initiator
-          trickle: true, // 设置为 true，以便即时发送 ICE Candidates
-          config: {
-            iceServers: [
-              {
-                urls: 'turn:192.168.40.100:23478',
-                username: 'jimmy',
-                credential: 'apple',
-              },
-            ],
-            iceTransportPolicy: 'relay', // 强制使用 TURN 中继
-          },
-        })
-
-        // 处理信令数据
-        this.peer.on('signal', data => {
-          const message = {
-            type: data.type, // 'offer', 'candidate'
-            payload: data,    // 直接传递对象
-          }
-          this.ws.send(JSON.stringify(message))
-          console.log('Sent signal message:', message)
-        })
-
-        // 处理接收到的视频流
-        this.peer.on('stream', stream => {
-          console.log('Received stream:', stream)
-          this.$refs.remoteVideo.srcObject = stream
-          this.$refs.remoteVideo.onloadedmetadata = () => {
-            console.log('Video metadata loaded.')
-            this.$refs.remoteVideo.play().then(() => {
-              console.log('Video is playing.')
-            }).catch(err => {
-              console.error('Failed to play video:', err)
-            })
-          }
-        })
-
-        // 处理来自 DataChannel 的数据（可选）
-        this.peer.on('data', data => {
-          // 可选：处理来自控制端的数据
-          console.log('Data received from peer:', data.toString())
-        })
-
-        // 处理错误
-        this.peer.on('error', err => {
-          console.error('Peer error:', err)
-        })
-
-        // 处理连接关闭
-        this.peer.on('close', () => {
-          console.log('Peer connection closed.')
-        })
-
-        // 监听 ICE 连接状态变化
-        this.peer.on('iceconnectionstatechange', state => {
-          console.log('ICE Connection State changed:', state)
-          if (state === 'failed' || state === 'disconnected') {
-            console.error('ICE connection failed or disconnected.')
-          }
-        })
-      }
-
-      // 处理来自信令服务器的消息
-      this.ws.onmessage = event => {
-        try {
-          const data = JSON.parse(event.data)
-          console.log('Received message:', data) // 确认消息内容
-
-          switch (data.type) {
-            case 'register_success':
-              // 注册成功，可以进行下一步操作
-              console.log('Registered successfully as viewer.')
-              break
-            case 'register_failed':
-              // 注册失败，显示错误
-              const reason = data.payload.reason
-              console.error('Register failed:', reason)
-              alert(`注册失败: ${reason}`)
-              break
-            case 'offer':
-              this.handleOffer(data.payload)
-              break
-            case 'answer':
-              this.handleAnswer(data.payload)
-              break
-            case 'candidate':
-              console.log(data.payload)
-              this.handleCandidate(data.payload)
-              break
-            case 'desktop_disconnected':
-              alert('桌面已断开连接。')
-              break
-            default:
-              console.log('Unknown message type:', data.type)
-          }
-        } catch (error) {
-          console.error('Error parsing message:', error)
+      // 处理远程视频流
+      this.peerConnection.ontrack = (event) => {
+        console.log('收到远程视频流:', event);
+        const remoteVideo = document.getElementById('remoteVideo');
+        if (remoteVideo.srcObject !== event.streams[0]) {
+          remoteVideo.srcObject = event.streams[0];
+          console.log('设置远程视频流');
         }
-      }
+      };
 
-      this.ws.onerror = error => {
-        console.error('WebSocket error:', error)
-      }
+      // 接收 DataChannel
+      this.peerConnection.ondatachannel = (event) => {
+        console.log('收到 DataChannel:', event.channel);
+        this.dataChannel = event.channel;
+        this.setupDataChannel();
+      };
 
-      this.ws.onclose = () => {
-        console.log('WebSocket connection closed.')
-      }
-    },
-    handleOffer(payload) {
-      // Viewer端通常不需要处理来自服务端的Offer
-      console.log('Received unexpected offer:', payload)
-    },
-    handleAnswer(payload) {
-      const answer = payload // 已经是对象
-      console.log('Received answer:', answer)
-      this.peer.signal(answer)
-    },
-    handleCandidate(payload) {
-      try {
-        // 构建 RTCIceCandidateInit 对象
-        const iceCandidateInit = new RTCIceCandidate({
-          candidate: payload.candidate,
-          sdpMLineIndex: payload.sdpMLineIndex,
-          sdpMid: payload.sdpMid
-        });
+      // 创建 DataChannel 用于发送控制指令
+      this.dataChannel = this.peerConnection.createDataChannel('control');
+      this.setupDataChannel();
 
-        console.log('Received ICE candidate:', iceCandidateInit.candidate);
+      // 创建 Offer 并发送给信令服务器
+      this.peerConnection.createOffer()
+          .then((offer) => {
+            return this.peerConnection.setLocalDescription(offer);
+          })
+          .then(() => {
+            const offerMessage = {
+              type: 'offer',
+              payload: this.peerConnection.localDescription
+            };
+            this.websocket.send(JSON.stringify(offerMessage));
+            console.log('发送 Offer:', offerMessage);
+          })
+          .catch((error) => {
+            console.error('创建 Offer 出错:', error);
+          });
+    },
+    handleAnswer(answer) {
+      const remoteDesc = new RTCSessionDescription(answer);
+      this.peerConnection.setRemoteDescription(remoteDesc)
+          .then(() => {
+            console.log('设置远程描述成功');
+          })
+          .catch((error) => {
+            console.error('设置远程描述出错:', error);
+          });
+    },
+    handleCandidate(candidate) {
+      const iceCandidate = new RTCIceCandidate(candidate);
+      this.peerConnection.addIceCandidate(iceCandidate)
+          .then(() => {
+            console.log('添加 ICE 候选成功');
+          })
+          .catch((error) => {
+            console.error('添加 ICE 候选出错:', error);
+          });
+    },
 
-        // 传递给 peer
-        this.peer.signal(iceCandidateInit);
+    setupDataChannel() {
+      this.dataChannel.onopen = () => {
+        console.log('DataChannel 已打开');
+        // DataChannel 打开后，设置事件监听
+        this.setupControlEvents();
+      };
+      this.dataChannel.onmessage = (event) => {
+        console.log('收到 DataChannel 消息:', event.data);
+      };
+      this.dataChannel.onerror = (error) => {
+        console.error('DataChannel 错误:', error);
+      };
+      this.dataChannel.onclose = () => {
+        console.log('DataChannel 已关闭');
+      };
+    },
 
-      } catch (error) {
-        console.error('Error constructing ICE candidate:', error);
+    setupControlEvents() {
+      const remoteVideo = document.getElementById('remoteVideo');
+
+      if (!this.controlEventsSetup) {
+        remoteVideo.addEventListener('mousemove', this.handleMouseMove);
+        remoteVideo.addEventListener('click', this.handleMouseClick);
+        window.addEventListener('keydown', this.handleKeyDown);
+        this.controlEventsSetup = true;
       }
     },
-    handleControlGranted() {
-      console.log('Control granted.')
-      this.isController = true
-      this.isDenied = false
-      alert('您已获得控制权！')
-      // 绑定键盘事件
-      window.addEventListener('keydown', this.handleKeyPressGlobal)
-    },
-    handleControlDenied() {
-      console.log('Control denied.')
-      this.isController = false
-      this.isDenied = true
-      alert('控制权已被占用，请稍后再试。')
-    },
-    requestControl() {
-      const request = {
-        type: 'control_command',
-        payload: { action: 'request_control' },
-      }
-      this.ws.send(JSON.stringify(request))
-      console.log('Sent control request.')
-    },
-    releaseControl() {
-      const release = {
-        type: 'control_command',
-        payload: { action: 'release_control' },
-      }
-      this.ws.send(JSON.stringify(release))
-      console.log('Sent control release.')
-      this.isController = false
-      this.isDenied = false
-      // 移除键盘事件
-      window.removeEventListener('keydown', this.handleKeyPressGlobal)
-    },
+
     handleMouseMove(event) {
-      if (!this.isController) return
+      const rect = event.target.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      console.log(event)
+      // 使用视频元素的尺寸
+      const videoElement = event.target;
+      const videoWidth = videoElement.videoWidth;
+      const videoHeight = videoElement.videoHeight;
 
-      // 计算鼠标在控制区域内的相对位置
-      const rect = event.target.getBoundingClientRect()
-      const x = Math.round(event.clientX - rect.left)
-      const y = Math.round(event.clientY - rect.top)
+      // 防止 videoWidth 或 videoHeight 为 0
+      if (videoWidth === 0 || videoHeight === 0) {
+        console.warn('视频尺寸未就绪');
+        return;
+      }
 
-      const cmd = {
+      const scaledX = Math.floor(x * videoWidth / rect.width);
+      const scaledY = Math.floor(y * videoHeight / rect.height);
+
+      const command = {
         action: 'mouse_move',
-        params: [x.toString(), y.toString()],
-      }
-      this.sendCommand(cmd)
+        params: [scaledX.toString(), scaledY.toString()]
+      };
+      this.dataChannel.send(JSON.stringify(command));
+      console.log('发送鼠标移动命令:', command);
     },
-    handleClick(event) {
-      if (!this.isController) return
 
-      const cmd = {
+    handleMouseClick(event) {
+      const command = {
         action: 'mouse_click',
-        params: ['left'], // 可根据需要更改为 'right' 等
-      }
-      this.sendCommand(cmd)
+        params: ['left'] // 根据需要调整
+      };
+      this.dataChannel.send(JSON.stringify(command));
+      console.log('发送鼠标点击命令:', command);
     },
-    handleKeyPress(event) {
-      // 仅当作为控制者时处理
-      if (!this.isController) return
-
-      const key = event.key
-      const cmd = {
+    handleKeyDown(event) {
+      const key = event.key;
+      const command = {
         action: 'key_press',
-        params: [key],
-      }
-      this.sendCommand(cmd)
-    },
-    handleKeyPressGlobal(event) {
-      // 全局键盘事件处理
-      this.handleKeyPress(event)
-    },
-    sendCommand(cmd) {
-      const cmdStr = JSON.stringify(cmd)
-      if (this.peer && this.peer.connected) {
-        this.peer.send(cmdStr)
-      }
-    },
+        params: [key]
+      };
+      this.dataChannel.send(JSON.stringify(command));
+      console.log('发送按键命令:', command);
+    }
   },
+  beforeDestroy() {
+    if (this.websocket) {
+      this.websocket.close();
+    }
+    if (this.peerConnection) {
+      this.peerConnection.close();
+    }
+  }
 }
 </script>
 
-<style scoped>
-.remote-desktop-container {
-  position: relative;
-  width: 800px;
-  height: 600px;
-  margin: auto;
-  border: 1px solid #ccc;
-}
-
-video {
+<style>
+#remoteVideo {
   width: 100%;
   height: 100%;
-  background-color: #000;
-}
-
-.control-area {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  /* 使控制区域透明但捕获鼠标事件 */
-  background-color: rgba(0, 0, 0, 0);
-  cursor: crosshair;
-  outline: none;
-}
-
-button {
-  position: absolute;
-  top: 10px;
-  left: 10px;
-  padding: 10px 20px;
-  z-index: 10;
-}
-
-.warning {
-  position: absolute;
-  top: 50px;
-  left: 10px;
-  color: red;
-  z-index: 10;
 }
 </style>
