@@ -5,10 +5,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"github.com/pion/webrtc/v3/pkg/media"
+	"github.com/pion/rtp"
+	"github.com/pion/rtp/codecs"
+	"github.com/pion/webrtc/v3/pkg/media/h264reader"
+
 	"image/jpeg"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -106,7 +110,8 @@ func main() {
 	}
 
 	// 创建视频轨道
-	videoTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
+	// 创建视频轨道，指定使用 H.264 编码器
+	videoTrack, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{
 		MimeType: webrtc.MimeTypeH264,
 	}, "video", "desktop")
 	if err != nil {
@@ -171,29 +176,31 @@ func main() {
 	// 启动 FFmpeg 进程，捕获屏幕并输出到管道
 
 	// 创建一个管道，用于捕获 FFmpeg 的输出
-	reader, writer := io.Pipe()
+	ffmpegReader, ffmpegWriter := io.Pipe()
 
 	// 启动 FFmpeg 进程并将输出重定向到管道
 	go func() {
 		err := ffmpeg.Input("desktop",
 			ffmpeg.KwArgs{
 				"f":         "gdigrab",
-				"framerate": "60", // 根据需要调整帧率
+				"framerate": "15", // 根据需要调整帧率
 			}).
 			Output("pipe:1",
 				ffmpeg.KwArgs{
-					"vcodec":  "libx264",   // 使用 H.264 编码器
-					"preset":  "ultrafast", // 根据需要调整预设
-					"tune":    "zerolatency",
-					"pix_fmt": "yuv420p",
-					"format":  "h264", // 使用 h264 格式
+					"vcodec":   "libx264",   // 使用 H.264 编码器
+					"preset":   "ultrafast", // 根据需要调整预设
+					"tune":     "zerolatency",
+					"pix_fmt":  "yuv420p",
+					"f":        "h264",  // 输出裸 H.264 流（Annex B 格式）
+					"g":        "30",    // 设置关键帧间隔，调整为适合的值
+					"loglevel": "quiet", // 禁用 FFmpeg 日志输出，可根据需要调整
 				}).
-			WithOutput(writer).
+			WithOutput(ffmpegWriter).
 			Run()
 		if err != nil {
 			log.Println("FFmpeg 进程出错:", err)
 		}
-		writer.Close()
+		ffmpegWriter.Close()
 	}()
 
 	// 读取 FFmpeg 输出并发送到 WebRTC
@@ -202,28 +209,82 @@ func main() {
 
 	go func() {
 		defer wg.Done()
+		// 使用 h264reader 读取 NAL 单元
+		h264Reader, err := h264reader.NewReader(ffmpegReader)
+		if err != nil {
+			log.Fatal("Failed to create H264 reader:", err)
+		}
+
+		// 创建 RTP Packetizer
+		payloadType := uint8(96) // 确保与 SDP 中的 PayloadType 一致
+		ssrc := rand.Uint32()    // 随机生成 SSRC
+
+		packetizer := rtp.NewPacketizer(
+			1200,        // MTU，最大传输单元
+			payloadType, // PayloadType，需与 SDP 中一致
+			ssrc,        // SSRC，随机生成
+			&codecs.H264Payloader{},
+			rtp.NewRandomSequencer(),
+			90000, // 时钟频率，视频通常为 90000
+		)
+
+		var (
+			sps       []byte
+			pps       []byte
+			timestamp uint32 = 0
+		)
 
 		for {
-			// 从 FFmpeg 读取编码后的数据
-			buf := make([]byte, 4096) // 可以根据需要调整缓冲区大小
-			n, err := reader.Read(buf)
+			// 读取 NAL 单元
+			nal, err := h264Reader.NextNAL()
 			if err != nil {
 				if err == io.EOF {
 					break
 				}
-				log.Println("读取 FFmpeg 输出时出错:", err)
-				break
+				log.Println("读取 NAL 单元时出错:", err)
+				continue
 			}
 
-			// 将读取的数据写入 WebRTC 视频轨道
-			err = videoTrack.WriteSample(media.Sample{
-				Data:     buf[:n],
-				Duration: time.Second / 60, // 与帧率对应
-			})
-			if err != nil {
-				log.Println("写入视频样本时出错:", err)
-				break
+			switch nal.UnitType {
+			case h264reader.NalUnitTypeSPS:
+				sps = append([]byte{}, nal.Data...)
+				continue
+			case h264reader.NalUnitTypePPS:
+				pps = append([]byte{}, nal.Data...)
+				continue
+			case h264reader.NalUnitTypeCodedSliceIdr:
+				// 在发送 IDR 帧之前，先发送 SPS 和 PPS
+				if sps != nil && pps != nil {
+					// 发送 SPS
+					spsPackets := packetizer.Packetize(sps, timestamp)
+					for _, packet := range spsPackets {
+						if err := videoTrack.WriteRTP(packet); err != nil {
+							log.Println("发送 SPS RTP 包时出错:", err)
+						}
+					}
+
+					// 发送 PPS
+					ppsPackets := packetizer.Packetize(pps, timestamp)
+					for _, packet := range ppsPackets {
+						if err := videoTrack.WriteRTP(packet); err != nil {
+							log.Println("发送 PPS RTP 包时出错:", err)
+						}
+					}
+				}
 			}
+
+			// 打包 NAL 单元为 RTP 包
+			packets := packetizer.Packetize(nal.Data, uint32(time.Now().UnixNano()/1e6))
+			for _, packet := range packets {
+				// 发送 RTP 包
+				if err := videoTrack.WriteRTP(packet); err != nil {
+					log.Println("发送 RTP 包时出错:", err)
+				}
+			}
+
+			// 更新时间戳，假设帧率为 15 fps
+			timestamp += 90000 / 15
+
 		}
 	}()
 

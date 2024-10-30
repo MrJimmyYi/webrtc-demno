@@ -76,9 +76,9 @@ export default {
       }
     },
     async initPeerConnection() {
-      // 指定支持的编解码器
+      // 检查浏览器是否支持 H.264 编码器
       const h264Codec = RTCRtpReceiver.getCapabilities('video').codecs.find(
-          codec => codec.mimeType === 'video/H264'
+          codec => codec.mimeType.toLowerCase() === 'video/h264'
       );
 
       if (!h264Codec) {
@@ -86,13 +86,14 @@ export default {
         return;
       }
 
+      // 创建 PeerConnection
       this.peerConnection = new RTCPeerConnection({
         iceServers: this.iceServers,
         iceTransportPolicy: 'relay' // 强制使用 TURN 服务器
       });
 
       // 调整编解码器优先级，将 H.264 放在首位
-      const transceiver = this.peerConnection.addTransceiver('video');
+      const transceiver = this.peerConnection.addTransceiver('video', { direction: 'recvonly' });
       transceiver.setCodecPreferences([h264Codec]);
 
       // 处理 ICE 候选
@@ -151,7 +152,7 @@ export default {
         console.error('创建 Offer 出错:', error);
       }
 
-      // 添加连接状态变化的监听器
+      // 添加连接状态变化的监听器（可选）
       this.peerConnection.oniceconnectionstatechange = () => {
         console.log('ICE 连接状态:', this.peerConnection.iceConnectionState);
       };
@@ -228,7 +229,6 @@ export default {
       };
       if (this.dataChannel && this.dataChannel.readyState === 'open') {
         this.dataChannel.send(JSON.stringify(command));
-        console.log('发送鼠标移动命令:', command);
       }
     },
     handleMouseClick(event) {
@@ -238,7 +238,6 @@ export default {
       };
       if (this.dataChannel && this.dataChannel.readyState === 'open') {
         this.dataChannel.send(JSON.stringify(command));
-        console.log('发送鼠标点击命令:', command);
       }
     },
     handleKeyDown(event) {
@@ -249,7 +248,6 @@ export default {
       };
       if (this.dataChannel && this.dataChannel.readyState === 'open') {
         this.dataChannel.send(JSON.stringify(command));
-        console.log('发送按键命令:', command);
       }
     }
   },
