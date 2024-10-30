@@ -1,6 +1,6 @@
 <template>
   <div id="app">
-    <video id="remoteVideo" autoplay playsinline @mousemove="handleMouseMove" @click="handleMouseClick"></video>
+    <video id="remoteVideo" autoplay playsinline muted></video>
   </div>
 </template>
 
@@ -75,11 +75,25 @@ export default {
           console.warn('未知的消息类型:', message.type);
       }
     },
-    initPeerConnection() {
+    async initPeerConnection() {
+      // 指定支持的编解码器
+      const h264Codec = RTCRtpReceiver.getCapabilities('video').codecs.find(
+          codec => codec.mimeType === 'video/H264'
+      );
+
+      if (!h264Codec) {
+        console.error('浏览器不支持 H.264 编码器');
+        return;
+      }
+
       this.peerConnection = new RTCPeerConnection({
         iceServers: this.iceServers,
         iceTransportPolicy: 'relay' // 强制使用 TURN 服务器
       });
+
+      // 调整编解码器优先级，将 H.264 放在首位
+      const transceiver = this.peerConnection.addTransceiver('video');
+      transceiver.setCodecPreferences([h264Codec]);
 
       // 处理 ICE 候选
       this.peerConnection.onicecandidate = (event) => {
@@ -99,9 +113,16 @@ export default {
       this.peerConnection.ontrack = (event) => {
         console.log('收到远程视频流:', event);
         const remoteVideo = document.getElementById('remoteVideo');
-        if (remoteVideo.srcObject !== event.streams[0]) {
-          remoteVideo.srcObject = event.streams[0];
+        const [stream] = event.streams;
+        if (remoteVideo.srcObject !== stream) {
+          remoteVideo.srcObject = stream;
           console.log('设置远程视频流');
+
+          // 在视频元数据加载后再设置事件监听器
+          remoteVideo.onloadedmetadata = () => {
+            console.log('视频元数据已加载');
+            this.setupControlEvents();
+          };
         }
       };
 
@@ -117,21 +138,26 @@ export default {
       this.setupDataChannel();
 
       // 创建 Offer 并发送给信令服务器
-      this.peerConnection.createOffer()
-          .then((offer) => {
-            return this.peerConnection.setLocalDescription(offer);
-          })
-          .then(() => {
-            const offerMessage = {
-              type: 'offer',
-              payload: this.peerConnection.localDescription
-            };
-            this.websocket.send(JSON.stringify(offerMessage));
-            console.log('发送 Offer:', offerMessage);
-          })
-          .catch((error) => {
-            console.error('创建 Offer 出错:', error);
-          });
+      try {
+        const offer = await this.peerConnection.createOffer();
+        await this.peerConnection.setLocalDescription(offer);
+        const offerMessage = {
+          type: 'offer',
+          payload: this.peerConnection.localDescription
+        };
+        this.websocket.send(JSON.stringify(offerMessage));
+        console.log('发送 Offer:', offerMessage);
+      } catch (error) {
+        console.error('创建 Offer 出错:', error);
+      }
+
+      // 添加连接状态变化的监听器
+      this.peerConnection.oniceconnectionstatechange = () => {
+        console.log('ICE 连接状态:', this.peerConnection.iceConnectionState);
+      };
+      this.peerConnection.onconnectionstatechange = () => {
+        console.log('连接状态:', this.peerConnection.connectionState);
+      };
     },
     handleAnswer(answer) {
       const remoteDesc = new RTCSessionDescription(answer);
@@ -153,12 +179,10 @@ export default {
             console.error('添加 ICE 候选出错:', error);
           });
     },
-
     setupDataChannel() {
       this.dataChannel.onopen = () => {
         console.log('DataChannel 已打开');
-        // DataChannel 打开后，设置事件监听
-        this.setupControlEvents();
+        // DataChannel 打开后，不立即设置事件监听，等待视频元数据加载完成
       };
       this.dataChannel.onmessage = (event) => {
         console.log('收到 DataChannel 消息:', event.data);
@@ -170,24 +194,21 @@ export default {
         console.log('DataChannel 已关闭');
       };
     },
-
     setupControlEvents() {
+      if (this.controlEventsSetup) return;
+
       const remoteVideo = document.getElementById('remoteVideo');
-
-      if (!this.controlEventsSetup) {
-        remoteVideo.addEventListener('mousemove', this.handleMouseMove);
-        remoteVideo.addEventListener('click', this.handleMouseClick);
-        window.addEventListener('keydown', this.handleKeyDown);
-        this.controlEventsSetup = true;
-      }
+      remoteVideo.addEventListener('mousemove', this.handleMouseMove);
+      remoteVideo.addEventListener('click', this.handleMouseClick);
+      window.addEventListener('keydown', this.handleKeyDown);
+      this.controlEventsSetup = true;
+      console.log('已设置控制事件监听器');
     },
-
     handleMouseMove(event) {
       const rect = event.target.getBoundingClientRect();
       const x = event.clientX - rect.left;
       const y = event.clientY - rect.top;
-      console.log(event)
-      // 使用视频元素的尺寸
+
       const videoElement = event.target;
       const videoWidth = videoElement.videoWidth;
       const videoHeight = videoElement.videoHeight;
@@ -205,17 +226,20 @@ export default {
         action: 'mouse_move',
         params: [scaledX.toString(), scaledY.toString()]
       };
-      this.dataChannel.send(JSON.stringify(command));
-      console.log('发送鼠标移动命令:', command);
+      if (this.dataChannel && this.dataChannel.readyState === 'open') {
+        this.dataChannel.send(JSON.stringify(command));
+        console.log('发送鼠标移动命令:', command);
+      }
     },
-
     handleMouseClick(event) {
       const command = {
         action: 'mouse_click',
         params: ['left'] // 根据需要调整
       };
-      this.dataChannel.send(JSON.stringify(command));
-      console.log('发送鼠标点击命令:', command);
+      if (this.dataChannel && this.dataChannel.readyState === 'open') {
+        this.dataChannel.send(JSON.stringify(command));
+        console.log('发送鼠标点击命令:', command);
+      }
     },
     handleKeyDown(event) {
       const key = event.key;
@@ -223,8 +247,10 @@ export default {
         action: 'key_press',
         params: [key]
       };
-      this.dataChannel.send(JSON.stringify(command));
-      console.log('发送按键命令:', command);
+      if (this.dataChannel && this.dataChannel.readyState === 'open') {
+        this.dataChannel.send(JSON.stringify(command));
+        console.log('发送按键命令:', command);
+      }
     }
   },
   beforeDestroy() {

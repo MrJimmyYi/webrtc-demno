@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/pion/webrtc/v3/pkg/media"
 	"image/jpeg"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -20,7 +22,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/kbinani/screenshot"
 	"github.com/pion/webrtc/v3"
-	"github.com/pion/webrtc/v3/pkg/media"
+	ffmpeg "github.com/u2takey/ffmpeg-go"
 )
 
 type CandidatePayload struct {
@@ -105,7 +107,7 @@ func main() {
 
 	// 创建视频轨道
 	videoTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
-		MimeType: webrtc.MimeTypeVP8,
+		MimeType: webrtc.MimeTypeH264,
 	}, "video", "desktop")
 	if err != nil {
 		log.Fatal("Failed to create video track:", err)
@@ -166,31 +168,61 @@ func main() {
 		log.Println("Sent ICE candidate.")
 	})
 
-	// 启动屏幕捕获并发送视频流
+	// 启动 FFmpeg 进程，捕获屏幕并输出到管道
+
+	// 创建一个管道，用于捕获 FFmpeg 的输出
+	reader, writer := io.Pipe()
+
+	// 启动 FFmpeg 进程并将输出重定向到管道
+	go func() {
+		err := ffmpeg.Input("desktop",
+			ffmpeg.KwArgs{
+				"f":         "gdigrab",
+				"framerate": "60", // 根据需要调整帧率
+			}).
+			Output("pipe:1",
+				ffmpeg.KwArgs{
+					"vcodec":  "libx264",   // 使用 H.264 编码器
+					"preset":  "ultrafast", // 根据需要调整预设
+					"tune":    "zerolatency",
+					"pix_fmt": "yuv420p",
+					"format":  "h264", // 使用 h264 格式
+				}).
+			WithOutput(writer).
+			Run()
+		if err != nil {
+			log.Println("FFmpeg 进程出错:", err)
+		}
+		writer.Close()
+	}()
+
+	// 读取 FFmpeg 输出并发送到 WebRTC
 	var wg sync.WaitGroup
 	wg.Add(1)
 
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(time.Second / 15) // 15 FPS，您可以根据需求调整
-		defer ticker.Stop()
 
 		for {
-			select {
-			case <-ticker.C:
-				img, err := captureScreen()
-				if err != nil {
-					log.Println("Failed to capture screen:", err)
-					continue
+			// 从 FFmpeg 读取编码后的数据
+			buf := make([]byte, 4096) // 可以根据需要调整缓冲区大小
+			n, err := reader.Read(buf)
+			if err != nil {
+				if err == io.EOF {
+					break
 				}
+				log.Println("读取 FFmpeg 输出时出错:", err)
+				break
+			}
 
-				// 将 JPEG 图片数据写入视频轨道
-				err = videoTrack.WriteSample(media.Sample{Data: img, Timestamp: time.Now()})
-				if err != nil {
-					log.Println("Failed to write video sample:", err)
-				}
-			case <-interrupt:
-				return
+			// 将读取的数据写入 WebRTC 视频轨道
+			err = videoTrack.WriteSample(media.Sample{
+				Data:     buf[:n],
+				Duration: time.Second / 60, // 与帧率对应
+			})
+			if err != nil {
+				log.Println("写入视频样本时出错:", err)
+				break
 			}
 		}
 	}()
