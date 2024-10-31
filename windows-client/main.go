@@ -9,6 +9,11 @@ import (
 	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v3/pkg/media/h264reader"
 
+	"github.com/go-vgo/robotgo"
+	"github.com/gorilla/websocket"
+	"github.com/kbinani/screenshot"
+	"github.com/pion/webrtc/v3"
+	ffmpeg "github.com/u2takey/ffmpeg-go"
 	"image/jpeg"
 	"io"
 	"log"
@@ -20,13 +25,6 @@ import (
 	"strconv"
 	"sync"
 	"syscall"
-	"time"
-
-	"github.com/go-vgo/robotgo"
-	"github.com/gorilla/websocket"
-	"github.com/kbinani/screenshot"
-	"github.com/pion/webrtc/v3"
-	ffmpeg "github.com/u2takey/ffmpeg-go"
 )
 
 type CandidatePayload struct {
@@ -183,7 +181,7 @@ func main() {
 		err := ffmpeg.Input("desktop",
 			ffmpeg.KwArgs{
 				"f":         "gdigrab",
-				"framerate": "15", // 根据需要调整帧率
+				"framerate": "30", // 根据需要调整帧率
 			}).
 			Output("pipe:1",
 				ffmpeg.KwArgs{
@@ -192,7 +190,7 @@ func main() {
 					"tune":     "zerolatency",
 					"pix_fmt":  "yuv420p",
 					"f":        "h264",  // 输出裸 H.264 流（Annex B 格式）
-					"g":        "30",    // 设置关键帧间隔，调整为适合的值
+					"g":        "15",    // 设置关键帧间隔，调整为适合的值
 					"loglevel": "quiet", // 禁用 FFmpeg 日志输出，可根据需要调整
 				}).
 			WithOutput(ffmpegWriter).
@@ -274,7 +272,7 @@ func main() {
 			}
 
 			// 打包 NAL 单元为 RTP 包
-			packets := packetizer.Packetize(nal.Data, uint32(time.Now().UnixNano()/1e6))
+			packets := packetizer.Packetize(nal.Data, timestamp)
 			for _, packet := range packets {
 				// 发送 RTP 包
 				if err := videoTrack.WriteRTP(packet); err != nil {
@@ -283,7 +281,7 @@ func main() {
 			}
 
 			// 更新时间戳，假设帧率为 15 fps
-			timestamp += 90000 / 15
+			timestamp += 90000 / 30
 
 		}
 	}()
@@ -479,7 +477,6 @@ func handleControlCommand(data []byte) {
 			return
 		}
 		robotgo.MoveMouse(x, y)
-		log.Printf("Moved mouse to (%d, %d)", x, y)
 	case "mouse_click":
 		if len(cmd.Params) != 1 {
 			log.Println("Invalid mouse_click parameters")

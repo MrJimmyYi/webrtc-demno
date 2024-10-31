@@ -78,7 +78,8 @@ export default {
     async initPeerConnection() {
       // 检查浏览器是否支持 H.264 编码器
       const h264Codec = RTCRtpReceiver.getCapabilities('video').codecs.find(
-          codec => codec.mimeType.toLowerCase() === 'video/h264'
+          codec => codec.mimeType.toLowerCase() === 'video/h264' &&
+              codec.sdpFmtpLine.includes('packetization-mode=1')
       );
 
       if (!h264Codec) {
